@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -48,7 +49,7 @@ func (c *cq) readyCount() uint32 {
 
 const MaxEntries uint32 = 1 << 15
 
-//Ring io_uring instance.
+// Ring io_uring instance.
 type Ring struct {
 	fd int
 
@@ -56,13 +57,16 @@ type Ring struct {
 
 	cqRing *cq
 	sqRing *sq
+
+	closed atomic.Bool
 }
 
 var ErrRingSetup = errors.New("ring setup")
+var ErrRingClosed = errors.New("ring is closed")
 
 type SetupOption func(params *ringParams)
 
-//WithCQSize set CQ max entries count.
+// WithCQSize set CQ max entries count.
 func WithCQSize(sz uint32) SetupOption {
 	return func(params *ringParams) {
 		params.flags = params.flags | setupCQSize
@@ -70,14 +74,14 @@ func WithCQSize(sz uint32) SetupOption {
 	}
 }
 
-//WithIOPoll enable IOPOLL option.
+// WithIOPoll enable IOPOLL option.
 func WithIOPoll() SetupOption {
 	return func(params *ringParams) {
 		params.flags = params.flags | setupIOPoll
 	}
 }
 
-//WithAttachedWQ use worker pool from another io_uring instance.
+// WithAttachedWQ use worker pool from another io_uring instance.
 func WithAttachedWQ(fd int) SetupOption {
 	return func(params *ringParams) {
 		params.flags = params.flags | setupAttachWQ
@@ -85,9 +89,9 @@ func WithAttachedWQ(fd int) SetupOption {
 	}
 }
 
-//WithSQPoll add IORING_SETUP_SQPOLL flag.
-//Note, that process must started with root privileges
-//or the user should have the CAP_SYS_NICE capability (for kernel version >= 5.11).
+// WithSQPoll add IORING_SETUP_SQPOLL flag.
+// Note, that process must started with root privileges
+// or the user should have the CAP_SYS_NICE capability (for kernel version >= 5.11).
 func WithSQPoll(threadIdle time.Duration) SetupOption {
 	return func(params *ringParams) {
 		params.flags = params.flags | setupSQPoll
@@ -95,7 +99,7 @@ func WithSQPoll(threadIdle time.Duration) SetupOption {
 	}
 }
 
-//WithSQThreadCPU bound poll thread to the cpu.
+// WithSQThreadCPU bound poll thread to the cpu.
 func WithSQThreadCPU(cpu uint32) SetupOption {
 	return func(params *ringParams) {
 		params.flags = params.flags | setupSQAff
@@ -103,7 +107,7 @@ func WithSQThreadCPU(cpu uint32) SetupOption {
 	}
 }
 
-//New create new io_uring instance with. Entries - size of SQ and CQ buffers.
+// New create new io_uring instance with. Entries - size of SQ and CQ buffers.
 func New(entries uint32, opts ...SetupOption) (*Ring, error) {
 	if entries > MaxEntries {
 		return nil, fmt.Errorf("%w, entries > MaxEntries", ErrRingSetup)
@@ -128,9 +132,9 @@ func New(entries uint32, opts ...SetupOption) (*Ring, error) {
 
 type Defer func() error
 
-//CreateMany create multiple io_uring instances. Entries - size of SQ and CQ buffers.
-//count - the number of io_uring instances. wpCount - the number of worker pools, this value must be a multiple of the entries.
-//If workerCount < count worker pool will be shared with setupAttachWQ flag.
+// CreateMany create multiple io_uring instances. Entries - size of SQ and CQ buffers.
+// count - the number of io_uring instances. wpCount - the number of worker pools, this value must be a multiple of the entries.
+// If workerCount < count worker pool will be shared with setupAttachWQ flag.
 func CreateMany(count int, entries uint32, wpCount int, opts ...SetupOption) ([]*Ring, Defer, error) {
 	if wpCount > count {
 		return nil, nil, errors.New("number of io_uring instances must be greater or equal number of worker pools")
@@ -182,19 +186,25 @@ func CreateMany(count int, entries uint32, wpCount int, opts ...SetupOption) ([]
 	}, nil
 }
 
-//Fd io_uring file descriptor.
+// Fd io_uring file descriptor.
 func (r *Ring) Fd() int {
 	return r.fd
 }
 
 func (r *Ring) Close() error {
+	r.closed.Store(true)
 	err := r.freeRing()
 	return joinErr(err, syscall.Close(r.fd))
 }
 
+// IsClosed returns true if the ring has been closed.
+func (r *Ring) IsClosed() bool {
+	return r.closed.Load()
+}
+
 var ErrSQOverflow = errors.New("sq ring overflow")
 
-//NextSQE return pointer of the next available SQE in SQ queue.
+// NextSQE return pointer of the next available SQE in SQ queue.
 func (r *Ring) NextSQE() (entry *SQEntry, err error) {
 	head := SmpLoadAcquireUint32(r.sqRing.kHead)
 	next := r.sqRing.sqeTail + 1
@@ -215,7 +225,7 @@ type Operation interface {
 	Code() OpCode
 }
 
-//QueueSQE adds an operation to the queue SQ.
+// QueueSQE adds an operation to the queue SQ.
 func (r *Ring) QueueSQE(op Operation, flags uint8, userData uint64) error {
 	sqe, err := r.NextSQE()
 	if err != nil {
@@ -228,7 +238,7 @@ func (r *Ring) QueueSQE(op Operation, flags uint8, userData uint64) error {
 	return nil
 }
 
-//Submit new SQEs. Return count of submitted SQEs.
+// Submit new SQEs. Return count of submitted SQEs.
 func (r *Ring) Submit() (uint, error) {
 	flushed := r.flushSQ()
 
@@ -335,8 +345,11 @@ func (r *Ring) getCQEvents(params getParams) (cqe *CQEvent, err error) {
 	return cqe, err
 }
 
-//WaitCQEventsWithTimeout wait cnt CQEs in CQ. Timeout will be exceeded if no new CQEs in queue.
+// WaitCQEventsWithTimeout wait cnt CQEs in CQ. Timeout will be exceeded if no new CQEs in queue.
 func (r *Ring) WaitCQEventsWithTimeout(cnt uint32, timeout time.Duration) (cqe *CQEvent, err error) {
+	if r.closed.Load() {
+		return nil, ErrRingClosed
+	}
 	if r.Params.ExtArgFeature() {
 		ts := syscall.NsecToTimespec(timeout.Nanoseconds())
 		arg := newGetEventsArg(uintptr(unsafe.Pointer(nil)), numSig/8, uintptr(unsafe.Pointer(&ts)))
@@ -383,7 +396,7 @@ func (r *Ring) WaitCQEventsWithTimeout(cnt uint32, timeout time.Duration) (cqe *
 	})
 }
 
-//WaitCQEvents wait cnt CQEs in CQ.
+// WaitCQEvents wait cnt CQEs in CQ.
 func (r *Ring) WaitCQEvents(cnt uint32) (cqe *CQEvent, err error) {
 	return r.getCQEvents(getParams{
 		submit: 0,
@@ -393,7 +406,7 @@ func (r *Ring) WaitCQEvents(cnt uint32) (cqe *CQEvent, err error) {
 	})
 }
 
-//SubmitAndWaitCQEvents submit new SQEs in SQE and wait cnt CQEs in CQ. Return first available CQE.
+// SubmitAndWaitCQEvents submit new SQEs in SQE and wait cnt CQEs in CQ. Return first available CQE.
 func (r *Ring) SubmitAndWaitCQEvents(cnt uint32) (cqe *CQEvent, err error) {
 	return r.getCQEvents(getParams{
 		submit: r.flushSQ(),
@@ -403,22 +416,25 @@ func (r *Ring) SubmitAndWaitCQEvents(cnt uint32) (cqe *CQEvent, err error) {
 	})
 }
 
-//PeekCQE return first available CQE from CQ.
+// PeekCQE return first available CQE from CQ.
 func (r *Ring) PeekCQE() (*CQEvent, error) {
 	return r.WaitCQEvents(0)
 }
 
-//SeenCQE dequeue CQ on 1 entry.
+// SeenCQE dequeue CQ on 1 entry.
 func (r *Ring) SeenCQE(cqe *CQEvent) {
 	r.AdvanceCQ(1)
 }
 
-//AdvanceCQ dequeue CQ on n entry.
+// AdvanceCQ dequeue CQ on n entry.
 func (r *Ring) AdvanceCQ(n uint32) {
 	SmpStoreReleaseUint32(r.cqRing.kHead, *r.cqRing.kHead+n)
 }
 
 func (r *Ring) peekCQEvent() (uint32, *CQEvent, error) {
+	if r.closed.Load() {
+		return 0, nil, ErrRingClosed
+	}
 	mask := *r.cqRing.kRingMask
 	var cqe *CQEvent
 	var available uint32
@@ -475,7 +491,7 @@ func min(a, b uint32) uint32 {
 	return b
 }
 
-//PeekCQEventBatch fill buffer by available CQEs. Return count of filled CQEs.
+// PeekCQEventBatch fill buffer by available CQEs. Return count of filled CQEs.
 func (r *Ring) PeekCQEventBatch(buff []*CQEvent) int {
 	n := r.peekCQEventBatch(buff)
 	if n == 0 {
