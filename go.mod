@@ -1,4 +1,4 @@
-module github.com/godzie44/go-uring
+module github.com/MarconZet/go-uring
 
 go 1.17
 
